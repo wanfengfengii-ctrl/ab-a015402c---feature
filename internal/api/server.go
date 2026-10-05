@@ -167,10 +167,83 @@ type goneBody struct {
 	EarliestAvailable int64  `json:"earliestAvailableId"`
 }
 
+// checkpointBody is the data payload of an SSE "checkpoint" frame. A run of
+// consecutive records skipped by the active severity filter collapses into
+// one checkpoint whose frame id and throughId are the global id of the last
+// record of the run, so a console that never displays those records can
+// still persist the cursor and resume past them.
+type checkpointBody struct {
+	ThroughID int64 `json:"throughId"`
+}
+
+// parseSeverityFilter reads the repeatable ?severity= query parameter.
+// Absent means an unfiltered stream with the legacy semantics. When present
+// it must carry 1–4 non-empty, mutually distinct exact values; anything else
+// is an error the handler turns into a 400 before any SSE byte is written.
+func parseSeverityFilter(r *http.Request) (map[string]bool, error) {
+	values, present := r.URL.Query()["severity"]
+	if !present {
+		return nil, nil
+	}
+	if len(values) == 0 || len(values) > 4 {
+		return nil, fmt.Errorf("severity accepts 1 to 4 values, got %d", len(values))
+	}
+	filter := make(map[string]bool, len(values))
+	for _, v := range values {
+		if strings.TrimSpace(v) == "" {
+			return nil, errors.New("severity values must not be empty")
+		}
+		if filter[v] {
+			return nil, fmt.Errorf("severity values must be distinct, %q is repeated", v)
+		}
+		filter[v] = true
+	}
+	return filter, nil
+}
+
+// emitEvents writes one drained batch to the stream in id (= publish) order
+// and advances cursor past every record read, matched or not. With no filter
+// every record is an "event" frame, exactly as before. With a filter,
+// matching records stay "event" frames while each maximal run of
+// non-matching records collapses into a single "checkpoint" frame. Because
+// the cursor moves past the whole batch, every id is covered at most once
+// across history and live reads, however publishes interleave. It reports
+// whether any frame was written (so the caller flushes only then).
+func emitEvents(w http.ResponseWriter, events []*store.StoredEvent, filter map[string]bool, cursor *int64) bool {
+	wrote := false
+	var through int64 // last unmatched id of the run currently collapsing
+	checkpoint := func() {
+		if through > 0 {
+			writeSSEEvent(w, "checkpoint", through, checkpointBody{ThroughID: through})
+			through = 0
+			wrote = true
+		}
+	}
+	for _, e := range events {
+		if filter == nil || filter[e.Severity] {
+			checkpoint()
+			writeSSEEvent(w, "event", e.ID, e)
+			wrote = true
+		} else {
+			through = e.ID
+		}
+		*cursor = e.ID
+	}
+	checkpoint()
+	return wrote
+}
+
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	channel := r.PathValue("channel")
 	if strings.TrimSpace(channel) == "" {
 		writeErr(w, http.StatusBadRequest, "channel must not be empty")
+		return
+	}
+
+	// An illegal filter must fail before the SSE response starts.
+	filter, err := parseSeverityFilter(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -228,7 +301,9 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	for {
 		// Re-read everything newer than the cursor. The store read is the
-		// single source of truth; the hub only wakes us.
+		// single source of truth; the hub only wakes us. The Gone check is
+		// deliberately filter-agnostic: cursor expiry is judged against the
+		// channel's full retained window, not the filtered view.
 		res := s.store.ReadHistory(channel, cursor)
 		if res.Gone {
 			writeSSEEvent(w, "error", 0, goneBody{
@@ -238,11 +313,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 			return
 		}
-		for _, e := range res.Events {
-			writeSSEEvent(w, "event", e.ID, e)
-			cursor = e.ID
-		}
-		if len(res.Events) > 0 {
+		if emitEvents(w, res.Events, filter, &cursor) {
 			flusher.Flush()
 		}
 

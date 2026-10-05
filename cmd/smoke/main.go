@@ -1,11 +1,12 @@
 // Command smoke is the one-shot end-to-end verifier. It waits for the
-// service to become healthy, then exercises four sections and folds their
+// service to become healthy, then exercises six sections and folds their
 // results into a bitmask exit code:
 //
-//	1  publishing / idempotent replay / 409 zero-write
-//	2  SSE live delivery and idle heartbeat
-//	4  SSE resume with Last-Event-ID (exactly-once, gapless)
-//	8  expired cursor -> HTTP 410 with earliestAvailableId
+//	1    publishing / idempotent replay / 409 zero-write
+//	2    SSE live delivery and idle heartbeat
+//	4    SSE resume with Last-Event-ID (exactly-once, gapless)
+//	8    expired cursor -> HTTP 410 with earliestAvailableId
+//	128  severity filter: checkpoints, filtered resume, quiet-channel progress
 //
 // Build failures and `go test` are aggregated by the verify entrypoint
 // (bits 16 and 32 respectively).
@@ -33,6 +34,7 @@ const (
 	bitGone    = 8
 	bitTests   = 16
 	bitBuild   = 32
+	bitFilter  = 128
 )
 
 type event struct {
@@ -85,7 +87,7 @@ func main() {
 
 	if err := waitHealthy(*base, 60*time.Second); err != nil {
 		fmt.Printf("[FATAL] service never became healthy: %v\n", err)
-		os.Exit(bitBuild | bitPublish | bitLive | bitResume | bitGone)
+		os.Exit(bitBuild | bitPublish | bitLive | bitResume | bitGone | bitFilter)
 	}
 	fmt.Println("service is healthy")
 
@@ -93,6 +95,8 @@ func main() {
 	run("SSE live delivery + heartbeat", bitLive, func() error { return checkLive(*base) })
 	run("SSE resume Last-Event-ID exactly-once", bitResume, func() error { return checkResume(*base) })
 	run("expired cursor -> 410", bitGone, func() error { return checkGone(*base) })
+	run("severity filter: checkpoints + filtered resume", bitFilter, func() error { return checkFilter(*base) })
+	run("severity filter: quiet-channel progress", bitFilter, func() error { return checkFilterQuiet(*base) })
 
 	fmt.Println()
 	if failed != 0 {
@@ -370,6 +374,14 @@ func checkGone(base string) error {
 				return fmt.Errorf("earliestAvailableId %d must exceed expired cursor %d", cb.EarliestAvailable, oldCursor)
 			}
 			earliest = cb.EarliestAvailable
+
+			// A severity filter must not change cursor-expiry semantics:
+			// the 410 is judged against the channel's full retained window.
+			fcode, fcb, fraw := getStreamStatusQuery(base, ch, oldCursor, "severity=critical")
+			if fcode != http.StatusGone || fcb.EarliestAvailable != earliest {
+				return fmt.Errorf("filtered expired cursor: want 410/earliest=%d, got %d/earliest=%d: %s",
+					earliest, fcode, fcb.EarliestAvailable, fraw)
+			}
 		case http.StatusOK:
 			continue
 		default:
@@ -408,7 +420,17 @@ func checkGone(base string) error {
 // HTTP status (draining/closing immediately). A 200 response is cancelled at
 // once; body is read minimally to obtain error JSON for 410.
 func getStreamStatus(base, channel string, after int64) (int, conflictBody, []byte) {
-	req, _ := http.NewRequest(http.MethodGet, base+"/streams/"+channel, nil)
+	return getStreamStatusQuery(base, channel, after, "")
+}
+
+// getStreamStatusQuery is getStreamStatus with an optional raw query string
+// (e.g. the repeatable severity filter).
+func getStreamStatusQuery(base, channel string, after int64, rawQuery string) (int, conflictBody, []byte) {
+	u := base + "/streams/" + channel
+	if rawQuery != "" {
+		u += "?" + rawQuery
+	}
+	req, _ := http.NewRequest(http.MethodGet, u, nil)
 	if after > 0 {
 		req.Header.Set("Last-Event-ID", strconv.FormatInt(after, 10))
 	}
@@ -432,7 +454,16 @@ func getStreamStatus(base, channel string, after int64) (int, conflictBody, []by
 // after==0 omits Last-Event-ID entirely. A non-200 status (e.g. 410) is
 // returned as an error containing the response body.
 func openStream(ctx context.Context, base, channel string, after int64) (<-chan sseEvent, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/streams/"+channel, nil)
+	return openStreamQuery(ctx, base, channel, after, "")
+}
+
+// openStreamQuery is openStream with an optional raw query string.
+func openStreamQuery(ctx context.Context, base, channel string, after int64, rawQuery string) (<-chan sseEvent, error) {
+	u := base + "/streams/" + channel
+	if rawQuery != "" {
+		u += "?" + rawQuery
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -494,4 +525,254 @@ func openStream(ctx context.Context, base, channel string, after int64) (<-chan 
 		}
 	}()
 	return out, nil
+}
+
+// nextFrame returns the next non-comment SSE frame or an error on timeout.
+func nextFrame(frames <-chan sseEvent, timeout time.Duration) (sseEvent, error) {
+	for {
+		select {
+		case f, ok := <-frames:
+			if !ok {
+				return sseEvent{}, fmt.Errorf("stream closed")
+			}
+			if f.Comment {
+				continue
+			}
+			return f, nil
+		case <-time.After(timeout):
+			return sseEvent{}, fmt.Errorf("timed out waiting for frame")
+		}
+	}
+}
+
+// expectNoFrame fails the check if any non-comment frame arrives within d.
+func expectNoFrame(frames <-chan sseEvent, d time.Duration) error {
+	deadline := time.After(d)
+	for {
+		select {
+		case f, ok := <-frames:
+			if !ok {
+				return nil
+			}
+			if f.Comment {
+				continue
+			}
+			return fmt.Errorf("expected silence, got frame %+v", f)
+		case <-deadline:
+			return nil
+		}
+	}
+}
+
+// checkThroughID verifies a checkpoint frame's data.throughId equals its id.
+func checkThroughID(f sseEvent) error {
+	var cp struct {
+		ThroughID int64 `json:"throughId"`
+	}
+	if err := json.Unmarshal([]byte(f.Data), &cp); err != nil {
+		return fmt.Errorf("checkpoint data not JSON: %q", f.Data)
+	}
+	if cp.ThroughID != f.ID {
+		return fmt.Errorf("checkpoint frame id %d != data.throughId %d", f.ID, cp.ThroughID)
+	}
+	return nil
+}
+
+// checkFilter exercises the severity filter: illegal filters are 400 before
+// SSE, matched records stay event frames, unmatched runs collapse into
+// checkpoint frames, and a reconnect from a checkpoint id resumes filtered
+// history without loss or duplication.
+func checkFilter(base string) error {
+	ch := fmt.Sprintf("smoke-filter-%d", time.Now().UnixNano())
+	query := "severity=critical&severity=warning"
+
+	// Illegal filters must be rejected before any SSE byte is written.
+	for _, q := range []string{
+		"severity=",                           // empty value
+		"severity=%20",                        // whitespace-only value
+		"severity=critical&severity=critical", // duplicates
+		"severity=a&severity=b&severity=c&severity=d&severity=e", // 5 values
+	} {
+		code, _, raw := getStreamStatusQuery(base, ch, 0, q)
+		if code != http.StatusBadRequest {
+			return fmt.Errorf("filter %q: want 400, got %d: %s", q, code, raw)
+		}
+	}
+
+	// History: critical, info, warning, info, critical (channel ids 1..5).
+	sevs := []string{"critical", "info", "warning", "info", "critical"}
+	var ids []int64
+	for i, sev := range sevs {
+		_, pr, _, raw := postEvents(base, ch, []event{mkEvent(fmt.Sprintf("f-%d", i), sev, "sev "+sev)})
+		if len(pr.Results) != 1 {
+			return fmt.Errorf("publish %d: %s", i, raw)
+		}
+		ids = append(ids, pr.Results[0].ID)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	frames, err := openStreamQuery(ctx, base, ch, 0, query)
+	if err != nil {
+		return err
+	}
+
+	// Expected frames: event, checkpoint, event, checkpoint, event.
+	want := []struct {
+		event string
+		id    int64
+	}{
+		{"event", ids[0]},
+		{"checkpoint", ids[1]},
+		{"event", ids[2]},
+		{"checkpoint", ids[3]},
+		{"event", ids[4]},
+	}
+	for i, w := range want {
+		f, err := nextFrame(frames, 5*time.Second)
+		if err != nil {
+			return err
+		}
+		if f.Event != w.event || f.ID != w.id {
+			return fmt.Errorf("frame %d: want %s id=%d, got %+v", i, w.event, w.id, f)
+		}
+		if w.event == "checkpoint" {
+			if err := checkThroughID(f); err != nil {
+				return err
+			}
+		}
+	}
+
+	// A live unmatched publish advances the cursor via a checkpoint...
+	_, pr, _, raw := postEvents(base, ch, []event{mkEvent("live-info", "info", "quiet live")})
+	if len(pr.Results) != 1 {
+		return fmt.Errorf("publish live-info: %s", raw)
+	}
+	quietID := pr.Results[0].ID
+	f, err := nextFrame(frames, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	if f.Event != "checkpoint" || f.ID != quietID {
+		return fmt.Errorf("live unmatched: want checkpoint id=%d, got %+v", quietID, f)
+	}
+	if err := checkThroughID(f); err != nil {
+		return err
+	}
+
+	// ...and a live matched publish stays a normal event frame.
+	_, pr, _, raw = postEvents(base, ch, []event{mkEvent("live-crit", "critical", "loud live")})
+	if len(pr.Results) != 1 {
+		return fmt.Errorf("publish live-crit: %s", raw)
+	}
+	loudID := pr.Results[0].ID
+	f, err = nextFrame(frames, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	if f.Event != "event" || f.ID != loudID || !strings.Contains(f.Data, "loud live") {
+		return fmt.Errorf("live matched: want event id=%d, got %+v", loudID, f)
+	}
+	cancel()
+
+	// Resume from the checkpoint id: only matching events after it, exactly
+	// once — filtered-out records must neither replay nor block progress.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel2()
+	frames2, err := openStreamQuery(ctx2, base, ch, quietID, query)
+	if err != nil {
+		return err
+	}
+	f, err = nextFrame(frames2, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	if f.Event != "event" || f.ID != loudID {
+		return fmt.Errorf("resume from checkpoint: want event id=%d, got %+v", loudID, f)
+	}
+	if err := expectNoFrame(frames2, 1500*time.Millisecond); err != nil {
+		return fmt.Errorf("after filtered resume: %w", err)
+	}
+	return nil
+}
+
+// checkFilterQuiet proves a channel whose records never match the filter
+// still advances the client's resume cursor: all unmatched history collapses
+// into one checkpoint, a reconnect from it is silent (no spurious 410), and
+// later unmatched/matched publishes arrive as checkpoint/event frames.
+func checkFilterQuiet(base string) error {
+	ch := fmt.Sprintf("smoke-quiet-%d", time.Now().UnixNano())
+
+	var lastID int64
+	for i := 0; i < 3; i++ {
+		_, pr, _, raw := postEvents(base, ch, []event{mkEvent(fmt.Sprintf("q-%d", i), "info", "quiet")})
+		if len(pr.Results) != 1 {
+			return fmt.Errorf("publish: %s", raw)
+		}
+		lastID = pr.Results[0].ID
+	}
+
+	// All unmatched history collapses into ONE checkpoint at the last id.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	frames, err := openStreamQuery(ctx, base, ch, 0, "severity=critical")
+	if err != nil {
+		cancel()
+		return err
+	}
+	f, err := nextFrame(frames, 5*time.Second)
+	if err != nil {
+		cancel()
+		return err
+	}
+	if f.Event != "checkpoint" || f.ID != lastID {
+		cancel()
+		return fmt.Errorf("quiet history: want one checkpoint id=%d, got %+v", lastID, f)
+	}
+	if err := checkThroughID(f); err != nil {
+		cancel()
+		return err
+	}
+	if err := expectNoFrame(frames, 1500*time.Millisecond); err != nil {
+		cancel()
+		return fmt.Errorf("quiet history: %w", err)
+	}
+	cancel()
+
+	// Reconnect from the checkpoint cursor: silence, then live progress.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel2()
+	frames2, err := openStreamQuery(ctx2, base, ch, lastID, "severity=critical")
+	if err != nil {
+		return err
+	}
+	if err := expectNoFrame(frames2, 1500*time.Millisecond); err != nil {
+		return fmt.Errorf("after checkpoint resume: %w", err)
+	}
+
+	_, pr, _, raw := postEvents(base, ch, []event{mkEvent("q-live", "info", "still quiet")})
+	if len(pr.Results) != 1 {
+		return fmt.Errorf("publish q-live: %s", raw)
+	}
+	quietLive := pr.Results[0].ID
+	f, err = nextFrame(frames2, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	if f.Event != "checkpoint" || f.ID != quietLive {
+		return fmt.Errorf("quiet live: want checkpoint id=%d, got %+v", quietLive, f)
+	}
+
+	_, pr, _, raw = postEvents(base, ch, []event{mkEvent("q-alarm", "critical", "beam stop")})
+	if len(pr.Results) != 1 {
+		return fmt.Errorf("publish q-alarm: %s", raw)
+	}
+	alarmID := pr.Results[0].ID
+	f, err = nextFrame(frames2, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	if f.Event != "event" || f.ID != alarmID || !strings.Contains(f.Data, "beam stop") {
+		return fmt.Errorf("matched live: want event id=%d, got %+v", alarmID, f)
+	}
+	return nil
 }

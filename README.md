@@ -17,6 +17,7 @@ crash-safe WAL files rebuilt on startup.
 | Idempotent ingestion | An event whose `eventKey` is already known **with identical content** replays the original result (same ids, `"replay": true`); no id is allocated and nothing is appended. |
 | Atomic conflict | If any event in a batch carries a known key with **different** content (or the same key appears twice in the batch with different content), the whole batch gets **HTTP 409 with zero writes**, with per-event pinpoint details. |
 | Gapless SSE resume | `GET /streams/{channel}` honors `Last-Event-ID`. History newer than the cursor is delivered first, then transitions seamlessly to live. Each event appears at most once, in id order. |
+| Severity filter | `GET /streams/{channel}?severity=critical&severity=warning` (1–4 distinct exact values) delivers matching records as `event` frames and collapses each run of non-matching records into one `checkpoint` frame whose `id`/`throughId` is the run's last global id — the resume cursor advances past filtered-out records, so a quiet channel never triggers a spurious 410. |
 | Exactly-once under concurrency | The hub carries no payload — it only wakes connections; each stream re-reads the store from its own cursor. A wakeup coalescing or arriving out of order can neither lose nor duplicate an event. |
 | Retention / expired cursor | Each channel keeps the newest `RETENTION_LIMIT` readable events. A resume cursor older than the oldest retained id is answered **HTTP 410** with `earliestAvailableId`. |
 | Durability & restart | Committed batches are fsynced WAL files (temp + fsync + rename). After restart: global numbering, replay verdicts, conflict verdicts and the 410 boundary are unchanged; numbering continues above every id ever assigned. The durable WAL retains full history even though reads are retention-bounded. |
@@ -112,12 +113,44 @@ Resume exactly like a browser EventSource:
 `Last-Event-ID` may also be passed as `?lastEventId=`. Missing → replay the
 retained window from the beginning.
 
+**Severity filter** — repeat `severity` 1–4 times with distinct, non-empty
+exact values to receive only those levels:
+
+```
+GET /streams/linac?severity=critical&severity=warning
+```
+
+Matching records are delivered as normal `event` frames. Each maximal run of
+non-matching records collapses into a single `checkpoint` frame whose frame
+`id` and `data.throughId` are both the **global id of the last record of the
+run**, so a console that never displays those records still advances its
+resume cursor past them:
+
+```
+id: 45
+event: checkpoint
+data: {"throughId":45}
+```
+
+Events and checkpoints always chain in channel publish order and every id is
+covered at most once, across the history→live transition and under concurrent
+publishes. An EventSource client needs no special handling: the checkpoint's
+`id` line updates its last-event-id automatically; just ignore the
+`checkpoint` event type when rendering. Omitting `severity` keeps the
+original all-events frame format, resume, heartbeat and error semantics
+unchanged. An illegal filter (empty/duplicated values, more than 4 values) is
+rejected with **400 before any SSE byte is written**.
+
 **410 — cursor expired by retention** (sent before any SSE bytes):
 
 ```json
 {"error":"Last-Event-ID 5 is older than the earliest retained id 18; resync from earliestAvailableId",
  "earliestAvailableId":18}
 ```
+
+Cursor expiry is always judged against the channel's **full retained window**,
+with or without a severity filter — filtered-out records never make a cursor
+live longer or expire sooner.
 
 If retention crosses an open stream's cursor mid-connection, the stream ends
 with an `event: error` carrying the same `earliestAvailableId`, so the client
@@ -130,6 +163,11 @@ Reconnecting with the last displayed global id restores, in id order
 older than `earliestAvailableId` can be sent (410 tells the console where the
 live window starts); any conflicting batch returns a locatable 409 and
 changes nothing.
+
+With `?severity=…` the console restores **only the severities it watches** —
+checkpoints, not alarms, represent everything else — and its resume position
+is never lost to filtered-out traffic: the last `checkpoint` id is a valid
+`Last-Event-ID` for the next reconnect.
 
 ## Run with Docker
 
@@ -148,18 +186,19 @@ curl -N localhost:8080/streams/linac
 ## One-shot `verify`
 
 Waits for `/health`, then aggregates **code tests, builds, publish/replay/
-conflict, live SSE + heartbeat, resume, expired-cursor and real-restart
-durability** into one bitmask exit code (`0` = all pass):
+conflict, live SSE + heartbeat, resume, expired-cursor, severity-filter and
+real-restart durability** into one bitmask exit code (`0` = all pass):
 
 | bit | section |
 |---|---|
 | 1 | publish / global-ids / replay / 409 zero-write |
 | 2 | SSE live delivery + 4 s heartbeat |
 | 4 | SSE `Last-Event-ID` resume (gapless, exactly-once) |
-| 8 | expired cursor → 410 + resync |
+| 8 | expired cursor → 410 + resync (unfiltered and filtered) |
 | 16 | `go test ./...` |
 | 32 | build all binaries |
 | 64 | durability across an actual process restart |
+| 128 | severity filter: checkpoints, filtered resume, quiet-channel progress |
 
 ```bash
 make verify                       # native one-shot gate
@@ -177,7 +216,7 @@ make test
 
 ```
 cmd/server/         HTTP/SSE service entrypoint
-cmd/smoke/          one-shot e2e verifier (publish/live/resume/410)
+cmd/smoke/          one-shot e2e verifier (publish/live/resume/410/filter)
 cmd/restart-smoke/  two-phase durability verifier (before/after restart)
 cmd/healthcheck/    tiny static /health probe for distroless HEALTHCHECK
 internal/store/     append-only log: global ids, atomic append, WAL, retention
