@@ -143,7 +143,19 @@ type frame struct {
 
 func openSSE(ctx context.Context, t *testing.T, base, channel string, lastID int64) (int, <-chan frame) {
 	t.Helper()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+"/streams/"+channel, nil)
+	return openSSEQuery(ctx, t, base, channel, "", lastID)
+}
+
+// openSSEQuery opens the SSE endpoint with an extra raw query string (e.g.
+// "severity=critical&severity=warning"). Non-200 responses are drained and
+// reported by status with a nil frame channel.
+func openSSEQuery(ctx context.Context, t *testing.T, base, channel, query string, lastID int64) (int, <-chan frame) {
+	t.Helper()
+	url := base + "/streams/" + channel
+	if query != "" {
+		url += "?" + query
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if lastID > 0 {
 		req.Header.Set("Last-Event-ID", strconv.FormatInt(lastID, 10))
 	}
@@ -382,5 +394,322 @@ func TestConcurrentPublishesExactlyOnce(t *testing.T) {
 	}
 	if len(got) != want {
 		t.Fatalf("unique ids = %d, want %d", len(got), want)
+	}
+}
+
+// ---- severity filter ---------------------------------------------------------
+
+func TestStreamSeverityFilterValidation(t *testing.T) {
+	srv, _ := newTestServer(t, 0)
+
+	bad := []string{
+		"severity=",                           // empty value
+		"severity=%20%20",                     // whitespace-only value
+		"severity=critical&severity=critical", // duplicate value
+		"severity=a&severity=b&severity=c&severity=d&severity=e", // 5 > max 4
+	}
+	for _, q := range bad {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		code, frames := openSSEQuery(ctx, t, srv.URL, "ch", q, 0)
+		cancel()
+		if code != http.StatusBadRequest {
+			t.Fatalf("query %q: want 400 before SSE, got %d", q, code)
+		}
+		if frames != nil {
+			t.Fatalf("query %q: 400 must not start an SSE stream", q)
+		}
+	}
+
+	good := []string{
+		"severity=critical",
+		"severity=critical&severity=warning&severity=info&severity=debug",
+	}
+	for _, q := range good {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		code, frames := openSSEQuery(ctx, t, srv.URL, "ch", q, 0)
+		if code != http.StatusOK {
+			cancel()
+			t.Fatalf("query %q: want 200, got %d", q, code)
+		}
+		// Idle filtered stream still heartbeats like an unfiltered one.
+		select {
+		case f := <-frames:
+			if !f.comment {
+				cancel()
+				t.Fatalf("query %q: expected heartbeat on empty channel, got %+v", q, f)
+			}
+		case <-time.After(5 * time.Second):
+			cancel()
+			t.Fatalf("query %q: no heartbeat", q)
+		}
+		cancel()
+	}
+}
+
+// checkpointIDs parses a checkpoint frame and asserts id == data.throughId.
+func checkpointIDs(t *testing.T, f frame) (int64, int64) {
+	t.Helper()
+	if f.event != "checkpoint" {
+		t.Fatalf("want checkpoint frame, got %+v", f)
+	}
+	var body struct {
+		ThroughID int64 `json:"throughId"`
+	}
+	if err := json.Unmarshal([]byte(f.data), &body); err != nil {
+		t.Fatalf("checkpoint data not JSON: %q", f.data)
+	}
+	if f.id != body.ThroughID {
+		t.Fatalf("checkpoint frame id %d != data.throughId %d", f.id, body.ThroughID)
+	}
+	return f.id, body.ThroughID
+}
+
+func TestStreamSeverityFilterHistoryAndLive(t *testing.T) {
+	srv, _ := newTestServer(t, 0)
+	ch := "filt"
+	// ids: 1 info, 2 critical, 3 info, 4 warning, 5 info
+	postBatch(t, srv.URL, ch, []map[string]any{
+		oneEvent("e1", "info", "skip 1"),
+		oneEvent("e2", "critical", "show 2"),
+		oneEvent("e3", "info", "skip 3"),
+		oneEvent("e4", "warning", "show 4"),
+		oneEvent("e5", "info", "skip 5"),
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	code, frames := openSSEQuery(ctx, t, srv.URL, ch, "severity=critical&severity=warning", 0)
+	if code != 200 {
+		t.Fatalf("stream code %d", code)
+	}
+
+	// History collapses skipped runs: ckpt(1), event(2), ckpt(3), event(4),
+	// and the trailing skipped record flushes as ckpt(5) before going idle.
+	f := waitEvent(t, frames, 3*time.Second)
+	if id, _ := checkpointIDs(t, f); id != 1 {
+		t.Fatalf("first checkpoint through %d, want 1", id)
+	}
+	f = waitEvent(t, frames, 3*time.Second)
+	if f.event != "event" || f.id != 2 || !strings.Contains(f.data, "show 2") {
+		t.Fatalf("frame 2 = %+v", f)
+	}
+	f = waitEvent(t, frames, 3*time.Second)
+	if id, _ := checkpointIDs(t, f); id != 3 {
+		t.Fatalf("checkpoint through %d, want 3", id)
+	}
+	f = waitEvent(t, frames, 3*time.Second)
+	if f.event != "event" || f.id != 4 || !strings.Contains(f.data, "show 4") {
+		t.Fatalf("frame 4 = %+v", f)
+	}
+	f = waitEvent(t, frames, 3*time.Second)
+	if id, _ := checkpointIDs(t, f); id != 5 {
+		t.Fatalf("trailing checkpoint through %d, want 5", id)
+	}
+
+	// Live: an unwatched publish collapses to a checkpoint, a watched one is
+	// a normal event frame, in publish order.
+	postBatch(t, srv.URL, ch, []map[string]any{oneEvent("e6", "info", "skip 6")})
+	f = waitEvent(t, frames, 3*time.Second)
+	if id, _ := checkpointIDs(t, f); id != 6 {
+		t.Fatalf("live checkpoint through %d, want 6", id)
+	}
+	postBatch(t, srv.URL, ch, []map[string]any{oneEvent("e7", "critical", "show 7")})
+	f = waitEvent(t, frames, 3*time.Second)
+	if f.event != "event" || f.id != 7 || !strings.Contains(f.data, "show 7") {
+		t.Fatalf("live frame = %+v", f)
+	}
+}
+
+func TestStreamSeverityFilterResume(t *testing.T) {
+	srv, _ := newTestServer(t, 0)
+	ch := "filt-resume"
+	postBatch(t, srv.URL, ch, []map[string]any{
+		oneEvent("a", "critical", "show 1"), // id 1
+		oneEvent("b", "info", "skip 2"),     // id 2
+		oneEvent("c", "debug", "skip 3"),    // id 3
+	})
+
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 8*time.Second)
+	_, frames1 := openSSEQuery(ctx1, t, srv.URL, ch, "severity=critical", 0)
+	f := waitEvent(t, frames1, 3*time.Second)
+	if f.event != "event" || f.id != 1 {
+		t.Fatalf("history event = %+v", f)
+	}
+	f = waitEvent(t, frames1, 3*time.Second)
+	through, _ := checkpointIDs(t, f)
+	if through != 3 {
+		t.Fatalf("checkpoint through %d, want 3", through)
+	}
+	cancel1() // network drop; client saved cursor = 3 from the checkpoint
+
+	// Published while disconnected: 4 skip, 5 show, 6 skip.
+	postBatch(t, srv.URL, ch, []map[string]any{
+		oneEvent("d", "info", "skip 4"),
+		oneEvent("e", "critical", "show 5"),
+		oneEvent("f", "info", "skip 6"),
+	})
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel2()
+	code, frames2 := openSSEQuery(ctx2, t, srv.URL, ch, "severity=critical", 3)
+	if code != 200 {
+		t.Fatalf("resume from checkpoint cursor: code %d", code)
+	}
+	// Only the watched event surfaces; skipped ids arrive folded in
+	// checkpoints; nothing at or below the cursor is re-covered.
+	f = waitEvent(t, frames2, 3*time.Second)
+	if id, _ := checkpointIDs(t, f); id != 4 {
+		t.Fatalf("resume checkpoint through %d, want 4", id)
+	}
+	f = waitEvent(t, frames2, 3*time.Second)
+	if f.event != "event" || f.id != 5 || !strings.Contains(f.data, "show 5") {
+		t.Fatalf("resume event = %+v", f)
+	}
+	f = waitEvent(t, frames2, 3*time.Second)
+	if id, _ := checkpointIDs(t, f); id != 6 {
+		t.Fatalf("resume trailing checkpoint through %d, want 6", id)
+	}
+	select {
+	case extra := <-frames2:
+		if !extra.comment {
+			t.Fatalf("duplicate/extra frame after resume: %+v", extra)
+		}
+	case <-time.After(1500 * time.Millisecond):
+	}
+}
+
+func TestStreamSeverityFilterQuietChannelAdvances(t *testing.T) {
+	srv, _ := newTestServer(t, 3) // tiny retention to prove cursor freshness
+	ch := "quiet"
+	// Fill the whole retained window with unwatched records: ids 1..3.
+	postBatch(t, srv.URL, ch, []map[string]any{
+		oneEvent("q1", "info", "noise 1"),
+		oneEvent("q2", "info", "noise 2"),
+		oneEvent("q3", "info", "noise 3"),
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	_, frames := openSSEQuery(ctx, t, srv.URL, ch, "severity=critical", 0)
+	f := waitEvent(t, frames, 3*time.Second)
+	through, _ := checkpointIDs(t, f)
+	if through != 3 {
+		t.Fatalf("quiet channel checkpoint through %d, want 3", through)
+	}
+
+	// More unwatched records keep advancing the checkpoint, pushing the
+	// oldest ids out of the retention window as they go. Each publish is
+	// drained before the next so the checkpoints arrive one at a time.
+	postBatch(t, srv.URL, ch, []map[string]any{oneEvent("q4", "info", "noise 4")})
+	f = waitEvent(t, frames, 3*time.Second)
+	if cursor, _ := checkpointIDs(t, f); cursor != 4 {
+		t.Fatalf("checkpoint cursor = %d, want 4", cursor)
+	}
+	postBatch(t, srv.URL, ch, []map[string]any{oneEvent("q5", "info", "noise 5")})
+	f = waitEvent(t, frames, 3*time.Second)
+	cursor, _ := checkpointIDs(t, f)
+	if cursor != 5 {
+		t.Fatalf("checkpoint cursor = %d, want 5", cursor)
+	}
+	cancel()
+
+	// Reconnect with the checkpoint cursor: NOT a 410, even though ids 1-2
+	// have aged out, because the cursor itself moved past them.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel2()
+	code, frames2 := openSSEQuery(ctx2, t, srv.URL, ch, "severity=critical", cursor)
+	if code != 200 {
+		t.Fatalf("reconnect at checkpoint cursor: want 200, got %d", code)
+	}
+	// A watched event after reconnect is delivered normally.
+	postBatch(t, srv.URL, ch, []map[string]any{oneEvent("q6", "critical", "real trip")})
+	f = waitEvent(t, frames2, 3*time.Second)
+	if f.event != "event" || f.id != 6 || !strings.Contains(f.data, "real trip") {
+		t.Fatalf("post-reconnect frame = %+v", f)
+	}
+}
+
+func TestStreamSeverityFilterGoneFullWindow(t *testing.T) {
+	srv, _ := newTestServer(t, 2)
+	ch := "filt-gone"
+	postBatch(t, srv.URL, ch, []map[string]any{oneEvent("a", "info", "1")}) // id 1
+	postBatch(t, srv.URL, ch, []map[string]any{oneEvent("b", "info", "2")}) // id 2
+	postBatch(t, srv.URL, ch, []map[string]any{oneEvent("c", "info", "3")}) // id 3 -> window 2,3
+
+	// Expiry is judged against the channel's full retention window, filter
+	// or not: cursor 1 < earliest retained 2 -> 410 before any SSE byte.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	code, frames := openSSEQuery(ctx, t, srv.URL, ch, "severity=critical", 1)
+	if code != http.StatusGone {
+		t.Fatalf("filtered expired cursor: want 410, got %d", code)
+	}
+	if frames != nil {
+		t.Fatal("410 must not start an SSE stream")
+	}
+}
+
+func TestConcurrentPublishesFilteredCoverage(t *testing.T) {
+	srv, _ := newTestServer(t, 0)
+	ch := "concurrent-filtered"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, frames := openSSEQuery(ctx, t, srv.URL, ch, "severity=critical&severity=warning", 0)
+
+	const publishers = 6
+	const perPub = 10
+	sevs := []string{"critical", "info", "warning", "debug"}
+	var wg sync.WaitGroup
+	for p := 0; p < publishers; p++ {
+		wg.Add(1)
+		go func(p int) {
+			defer wg.Done()
+			for i := 0; i < perPub; i++ {
+				key := fmt.Sprintf("p%d-e%d", p, i)
+				sev := sevs[(p+i)%len(sevs)]
+				code, raw := postBatch(t, srv.URL, ch, []map[string]any{oneEvent(key, sev, key)})
+				if code != 200 {
+					t.Errorf("publish %s: %d %s", key, code, raw)
+					return
+				}
+			}
+		}(p)
+	}
+	wg.Wait()
+
+	// Every id must be covered exactly once, in publish order: watched ids
+	// as event frames, unwatched runs folded into checkpoints. Frame ids
+	// (event id / checkpoint throughId) therefore strictly increase and an
+	// event frame always continues exactly one past the previous coverage.
+	want := int64(publishers * perPub)
+	var covered, events int64
+	deadline := time.After(10 * time.Second)
+	for covered < want {
+		select {
+		case f := <-frames:
+			if f.comment {
+				continue
+			}
+			if f.id <= covered {
+				t.Fatalf("id coverage regressed/overlapped: frame %+v after %d", f, covered)
+			}
+			switch f.event {
+			case "event":
+				if f.id != covered+1 {
+					t.Fatalf("event id %d not contiguous after coverage %d", f.id, covered)
+				}
+				events++
+			case "checkpoint":
+				checkpointIDs(t, f)
+			default:
+				t.Fatalf("unexpected frame type %+v", f)
+			}
+			covered = f.id
+		case <-deadline:
+			t.Fatalf("coverage stalled at %d/%d (events=%d)", covered, want, events)
+		}
+	}
+	if events == 0 || events == want {
+		t.Fatalf("expected a mix of events and checkpoints, got %d/%d events", events, want)
 	}
 }

@@ -18,6 +18,8 @@ const (
 	MaxBatchSize = 50
 	// HeartbeatInterval is the SSE idle comment interval (< 5s required).
 	HeartbeatInterval = 4 * time.Second
+	// MaxSeverityFilters bounds the repeatable ?severity= stream filter.
+	MaxSeverityFilters = 4
 )
 
 // Config holds runtime knobs for the server.
@@ -167,6 +169,14 @@ type goneBody struct {
 	EarliestAvailable int64  `json:"earliestAvailableId"`
 }
 
+// checkpointBody is the data payload of an `event: checkpoint` frame: every
+// record up to and including throughId was skipped by the severity filter,
+// so the client can persist throughId as its resume cursor without having
+// displayed anything for those records.
+type checkpointBody struct {
+	ThroughID int64 `json:"throughId"`
+}
+
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	channel := r.PathValue("channel")
 	if strings.TrimSpace(channel) == "" {
@@ -177,6 +187,14 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	lastID, ok := parseLastEventID(r)
 	if !ok {
 		writeErr(w, http.StatusBadRequest, "Last-Event-ID must be a non-negative integer")
+		return
+	}
+
+	// The severity filter is validated up front: an illegal filter must
+	// produce a 400 before any SSE byte is written.
+	filter, err := parseSeverityFilter(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -238,11 +256,40 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 			return
 		}
+		wrote := false
+		// pending is the last id of the current run of records the severity
+		// filter skipped. The run collapses into a single checkpoint frame
+		// emitted before the next matching event (or before going idle), so
+		// frames stay in publish order and every id is covered at most once.
+		pending := int64(0)
 		for _, e := range res.Events {
+			if filter != nil {
+				if _, watched := filter[e.Severity]; !watched {
+					// Skipped by the filter: fold into the pending run. The
+					// cursor still advances, so this record is never
+					// re-read and never delivered twice.
+					pending = e.ID
+					cursor = e.ID
+					continue
+				}
+				if pending > 0 {
+					writeCheckpoint(w, pending)
+					pending = 0
+					wrote = true
+				}
+			}
 			writeSSEEvent(w, "event", e.ID, e)
 			cursor = e.ID
+			wrote = true
 		}
-		if len(res.Events) > 0 {
+		if pending > 0 {
+			// Trailing skipped run: flush the checkpoint before going idle
+			// so even a channel quiet in the watched severities keeps
+			// moving the client's resume cursor forward.
+			writeCheckpoint(w, pending)
+			wrote = true
+		}
+		if wrote {
 			flusher.Flush()
 		}
 
@@ -275,6 +322,40 @@ func parseLastEventID(r *http.Request) (int64, bool) {
 		return 0, false
 	}
 	return id, true
+}
+
+// parseSeverityFilter reads the repeatable ?severity= query parameter. When
+// it is absent the filter is disabled (nil set) and the stream keeps its
+// original unfiltered frame semantics. When present it must carry 1 to
+// MaxSeverityFilters non-empty, mutually distinct exact values; anything
+// else is a 400-level client error.
+func parseSeverityFilter(r *http.Request) (map[string]struct{}, error) {
+	vals, present := r.URL.Query()["severity"]
+	if !present || len(vals) == 0 {
+		return nil, nil
+	}
+	if len(vals) > MaxSeverityFilters {
+		return nil, fmt.Errorf("at most %d severity filters allowed, got %d", MaxSeverityFilters, len(vals))
+	}
+	set := make(map[string]struct{}, len(vals))
+	for _, v := range vals {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return nil, errors.New("severity filter values must not be empty")
+		}
+		if _, dup := set[v]; dup {
+			return nil, fmt.Errorf("duplicate severity filter %q", v)
+		}
+		set[v] = struct{}{}
+	}
+	return set, nil
+}
+
+// writeCheckpoint emits one `event: checkpoint` frame whose id and
+// data.throughId are both the last skipped record's global id, so a
+// filtering client advances its resume cursor without rendering an alert.
+func writeCheckpoint(w http.ResponseWriter, throughID int64) {
+	writeSSEEvent(w, "checkpoint", throughID, checkpointBody{ThroughID: throughID})
 }
 
 // writeSSEEvent writes one event frame. id=0 means "do not emit an id line"

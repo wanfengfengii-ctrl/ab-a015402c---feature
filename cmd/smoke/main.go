@@ -1,14 +1,16 @@
 // Command smoke is the one-shot end-to-end verifier. It waits for the
-// service to become healthy, then exercises four sections and folds their
+// service to become healthy, then exercises six sections and folds their
 // results into a bitmask exit code:
 //
 //	1  publishing / idempotent replay / 409 zero-write
 //	2  SSE live delivery and idle heartbeat
 //	4  SSE resume with Last-Event-ID (exactly-once, gapless)
 //	8  expired cursor -> HTTP 410 with earliestAvailableId
+//	128  severity filter: 400s, filtered resume via checkpoints,
+//	     quiet-channel cursor advancement, filtered 410
 //
 // Build failures and `go test` are aggregated by the verify entrypoint
-// (bits 16 and 32 respectively).
+// (bits 32 and 16 respectively).
 package main
 
 import (
@@ -33,6 +35,7 @@ const (
 	bitGone    = 8
 	bitTests   = 16
 	bitBuild   = 32
+	bitFilter  = 128
 )
 
 type event struct {
@@ -85,7 +88,7 @@ func main() {
 
 	if err := waitHealthy(*base, 60*time.Second); err != nil {
 		fmt.Printf("[FATAL] service never became healthy: %v\n", err)
-		os.Exit(bitBuild | bitPublish | bitLive | bitResume | bitGone)
+		os.Exit(bitBuild | bitPublish | bitLive | bitResume | bitGone | bitFilter)
 	}
 	fmt.Println("service is healthy")
 
@@ -93,6 +96,8 @@ func main() {
 	run("SSE live delivery + heartbeat", bitLive, func() error { return checkLive(*base) })
 	run("SSE resume Last-Event-ID exactly-once", bitResume, func() error { return checkResume(*base) })
 	run("expired cursor -> 410", bitGone, func() error { return checkGone(*base) })
+	run("SSE severity filter: validation + filtered resume", bitFilter, func() error { return checkFilterResume(*base) })
+	run("SSE severity filter: quiet channel advances cursor", bitFilter, func() error { return checkFilterQuiet(*base) })
 
 	fmt.Println()
 	if failed != 0 {
@@ -404,11 +409,305 @@ func checkGone(base string) error {
 	return fmt.Errorf("retention window never crossed (publishing could not age out id %d)", oldCursor)
 }
 
+// nextFrame returns the next non-comment SSE frame.
+func nextFrame(frames <-chan sseEvent, timeout time.Duration) (sseEvent, error) {
+	for {
+		select {
+		case f, ok := <-frames:
+			if !ok {
+				return sseEvent{}, fmt.Errorf("stream closed while waiting for frame")
+			}
+			if f.Comment {
+				continue
+			}
+			return f, nil
+		case <-time.After(timeout):
+			return sseEvent{}, fmt.Errorf("timed out after %s waiting for frame", timeout)
+		}
+	}
+}
+
+// mustCheckpoint asserts f is a checkpoint frame whose frame id equals
+// data.throughId, and returns that id.
+func mustCheckpoint(f sseEvent) (int64, error) {
+	if f.Event != "checkpoint" {
+		return 0, fmt.Errorf("want checkpoint frame, got %+v", f)
+	}
+	var body struct {
+		ThroughID int64 `json:"throughId"`
+	}
+	if err := json.Unmarshal([]byte(f.Data), &body); err != nil {
+		return 0, fmt.Errorf("checkpoint data not JSON: %q", f.Data)
+	}
+	if body.ThroughID != f.ID {
+		return 0, fmt.Errorf("checkpoint frame id %d != data.throughId %d", f.ID, body.ThroughID)
+	}
+	return f.ID, nil
+}
+
+// checkFilterResume covers the filtered-stream contract: invalid filters are
+// 400s, unwatched history collapses into checkpoints, and a reconnect from a
+// checkpoint cursor resumes gaplessly with every id covered at most once.
+func checkFilterResume(base string) error {
+	ch := fmt.Sprintf("smoke-filt-%d", time.Now().UnixNano())
+
+	// Illegal filters must be rejected before any SSE byte is written.
+	for _, q := range []string{
+		"severity=",
+		"severity=critical&severity=critical",
+		"severity=a&severity=b&severity=c&severity=d&severity=e",
+	} {
+		code, _, raw := getStreamStatusQuery(base, ch, q, 0)
+		if code != http.StatusBadRequest {
+			return fmt.Errorf("filter %q: want 400, got %d: %s", q, code, raw)
+		}
+	}
+
+	const query = "severity=critical&severity=warning"
+	n := 0
+	postSev := func(sev string) (int64, error) {
+		n++
+		code, pr, _, raw := postEvents(base, ch, []event{mkEvent(
+			fmt.Sprintf("f-%d-%d", time.Now().UnixNano(), n), sev, fmt.Sprintf("m%d", n))})
+		if code != http.StatusOK || len(pr.Results) != 1 {
+			return 0, fmt.Errorf("post severity %s: status %d: %s", sev, code, raw)
+		}
+		return pr.Results[0].ID, nil
+	}
+
+	// Mixed history: skip, show, skip, show, skip.
+	sevs := []string{"info", "critical", "info", "warning", "info"}
+	ids := make([]int64, 0, len(sevs))
+	for _, sev := range sevs {
+		id, err := postSev(sev)
+		if err != nil {
+			return err
+		}
+		ids = append(ids, id)
+	}
+
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 15*time.Second)
+	frames1, err := openStreamQuery(ctx1, base, ch, query, 0)
+	if err != nil {
+		cancel1()
+		return err
+	}
+	// Skipped runs fold into checkpoints around the watched events.
+	wantSeq := []struct {
+		kind string // "checkpoint" or "event"
+		id   int64
+	}{
+		{"checkpoint", ids[0]},
+		{"event", ids[1]},
+		{"checkpoint", ids[2]},
+		{"event", ids[3]},
+		{"checkpoint", ids[4]},
+	}
+	var covered int64
+	for _, w := range wantSeq {
+		f, err := nextFrame(frames1, 5*time.Second)
+		if err != nil {
+			cancel1()
+			return err
+		}
+		if f.ID <= covered {
+			cancel1()
+			return fmt.Errorf("frame id %d overlaps already-covered %d", f.ID, covered)
+		}
+		switch w.kind {
+		case "checkpoint":
+			if _, err := mustCheckpoint(f); err != nil {
+				cancel1()
+				return err
+			}
+		default:
+			if f.Event != "event" {
+				cancel1()
+				return fmt.Errorf("want event frame for id %d, got %+v", w.id, f)
+			}
+		}
+		if f.ID != w.id {
+			cancel1()
+			return fmt.Errorf("%s: want id %d, got %+v", w.kind, w.id, f)
+		}
+		covered = f.ID
+	}
+	cancel1() // "network drop": client keeps covered (= ids[4]) as cursor
+
+	// More mixed events land while disconnected.
+	gapSkip, err := postSev("info")
+	if err != nil {
+		return err
+	}
+	gapShow, err := postSev("critical")
+	if err != nil {
+		return err
+	}
+
+	// Resume from the checkpoint cursor: the skipped gap event arrives only
+	// as a checkpoint, the watched one as an event, then live continues.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel2()
+	frames2, err := openStreamQuery(ctx2, base, ch, query, covered)
+	if err != nil {
+		return err
+	}
+	f, err := nextFrame(frames2, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	if through, err := mustCheckpoint(f); err != nil {
+		return err
+	} else if through != gapSkip {
+		return fmt.Errorf("resume checkpoint through %d, want %d", through, gapSkip)
+	}
+	f, err = nextFrame(frames2, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	if f.Event != "event" || f.ID != gapShow {
+		return fmt.Errorf("resume event: want id %d, got %+v", gapShow, f)
+	}
+	liveShow, err := postSev("warning")
+	if err != nil {
+		return err
+	}
+	f, err = nextFrame(frames2, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	if f.Event != "event" || f.ID != liveShow {
+		return fmt.Errorf("post-resume live event: want id %d, got %+v", liveShow, f)
+	}
+	return nil
+}
+
+// checkFilterQuiet proves the original motivation for checkpoints: on a
+// channel quiet in the watched severities, the client's resume cursor still
+// tracks the newest id, so a reconnect after retention trimmed everything it
+// ever received is a 200 — while a genuinely expired cursor stays a 410.
+func checkFilterQuiet(base string) error {
+	ch := fmt.Sprintf("smoke-quiet-%d", time.Now().UnixNano())
+	const query = "severity=critical"
+	n := 0
+	postNoise := func() (int64, error) {
+		n++
+		code, pr, _, raw := postEvents(base, ch, []event{mkEvent(
+			fmt.Sprintf("q-%d-%d", time.Now().UnixNano(), n), "info", "noise")})
+		if code != http.StatusOK || len(pr.Results) != 1 {
+			return 0, fmt.Errorf("post noise: status %d: %s", code, raw)
+		}
+		return pr.Results[0].ID, nil
+	}
+
+	anchor, err := postNoise()
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	frames, err := openStreamQuery(ctx, base, ch, query, 0)
+	if err != nil {
+		return err
+	}
+	// The lone unwatched record arrives as a checkpoint, not an alert.
+	f, err := nextFrame(frames, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	through, err := mustCheckpoint(f)
+	if err != nil {
+		return err
+	}
+	if through != anchor {
+		return fmt.Errorf("first checkpoint through %d, want %d", through, anchor)
+	}
+	cursor := anchor
+
+	// Publish unwatched noise until retention pushes the anchor out. Every
+	// publish must move the open stream's checkpoint to the new id.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		code, cb, raw := getStreamStatusQuery(base, ch, query, anchor)
+		switch code {
+		case http.StatusGone:
+			if cb.EarliestAvailable <= anchor {
+				return fmt.Errorf("filtered 410: earliestAvailableId %d must exceed expired cursor %d",
+					cb.EarliestAvailable, anchor)
+			}
+		case http.StatusOK:
+			// Anchor still retained: keep filling the window.
+		default:
+			return fmt.Errorf("probing filtered anchor cursor: status %d: %s", code, raw)
+		}
+		if code == http.StatusGone {
+			break
+		}
+		id, err := postNoise()
+		if err != nil {
+			return err
+		}
+		f, err := nextFrame(frames, 5*time.Second)
+		if err != nil {
+			return err
+		}
+		through, err := mustCheckpoint(f)
+		if err != nil {
+			return err
+		}
+		if through != id {
+			return fmt.Errorf("checkpoint through %d, want %d", through, id)
+		}
+		cursor = id
+		if time.Now().After(deadline) {
+			return fmt.Errorf("anchor id %d never aged out of the retention window", anchor)
+		}
+	}
+
+	// Reconnect with the last checkpoint cursor: NOT a 410, because the
+	// cursor advanced past everything the filter skipped.
+	code, _, raw := getStreamStatusQuery(base, ch, query, cursor)
+	if code != http.StatusOK {
+		return fmt.Errorf("reconnect at checkpoint cursor %d: want 200, got %d: %s", cursor, code, raw)
+	}
+
+	// And a watched event after that reconnect is a normal event frame.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel2()
+	frames2, err := openStreamQuery(ctx2, base, ch, query, cursor)
+	if err != nil {
+		return err
+	}
+	code, pr, _, raw := postEvents(base, ch, []event{mkEvent(
+		fmt.Sprintf("q-trip-%d", time.Now().UnixNano()), "critical", "real trip")})
+	if code != http.StatusOK || len(pr.Results) != 1 {
+		return fmt.Errorf("post trip: status %d: %s", code, raw)
+	}
+	f, err = nextFrame(frames2, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	if f.Event != "event" || f.ID != pr.Results[0].ID || !strings.Contains(f.Data, "real trip") {
+		return fmt.Errorf("post-reconnect trip frame = %+v", f)
+	}
+	return nil
+}
+
 // getStreamStatus opens the SSE endpoint with a cursor and returns just the
 // HTTP status (draining/closing immediately). A 200 response is cancelled at
 // once; body is read minimally to obtain error JSON for 410.
 func getStreamStatus(base, channel string, after int64) (int, conflictBody, []byte) {
-	req, _ := http.NewRequest(http.MethodGet, base+"/streams/"+channel, nil)
+	return getStreamStatusQuery(base, channel, "", after)
+}
+
+// getStreamStatusQuery is getStreamStatus with an extra raw query string.
+func getStreamStatusQuery(base, channel, query string, after int64) (int, conflictBody, []byte) {
+	url := base + "/streams/" + channel
+	if query != "" {
+		url += "?" + query
+	}
+	req, _ := http.NewRequest(http.MethodGet, url, nil)
 	if after > 0 {
 		req.Header.Set("Last-Event-ID", strconv.FormatInt(after, 10))
 	}
@@ -432,7 +731,17 @@ func getStreamStatus(base, channel string, after int64) (int, conflictBody, []by
 // after==0 omits Last-Event-ID entirely. A non-200 status (e.g. 410) is
 // returned as an error containing the response body.
 func openStream(ctx context.Context, base, channel string, after int64) (<-chan sseEvent, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/streams/"+channel, nil)
+	return openStreamQuery(ctx, base, channel, "", after)
+}
+
+// openStreamQuery is openStream with an extra raw query string (e.g. the
+// repeatable severity filter).
+func openStreamQuery(ctx context.Context, base, channel, query string, after int64) (<-chan sseEvent, error) {
+	url := base + "/streams/" + channel
+	if query != "" {
+		url += "?" + query
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}

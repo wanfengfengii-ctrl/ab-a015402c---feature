@@ -17,6 +17,7 @@ crash-safe WAL files rebuilt on startup.
 | Idempotent ingestion | An event whose `eventKey` is already known **with identical content** replays the original result (same ids, `"replay": true`); no id is allocated and nothing is appended. |
 | Atomic conflict | If any event in a batch carries a known key with **different** content (or the same key appears twice in the batch with different content), the whole batch gets **HTTP 409 with zero writes**, with per-event pinpoint details. |
 | Gapless SSE resume | `GET /streams/{channel}` honors `Last-Event-ID`. History newer than the cursor is delivered first, then transitions seamlessly to live. Each event appears at most once, in id order. |
+| Severity filter + checkpoints | `GET /streams/{channel}?severity=critical&severity=warning` (1–4 distinct exact values) delivers only watched severities as `event` frames; runs of skipped records collapse into `event: checkpoint` frames whose `id`/`data.throughId` equal the last skipped id, so the resume cursor keeps advancing on quiet channels. |
 | Exactly-once under concurrency | The hub carries no payload — it only wakes connections; each stream re-reads the store from its own cursor. A wakeup coalescing or arriving out of order can neither lose nor duplicate an event. |
 | Retention / expired cursor | Each channel keeps the newest `RETENTION_LIMIT` readable events. A resume cursor older than the oldest retained id is answered **HTTP 410** with `earliestAvailableId`. |
 | Durability & restart | Committed batches are fsynced WAL files (temp + fsync + rename). After restart: global numbering, replay verdicts, conflict verdicts and the 410 boundary are unchanged; numbering continues above every id ever assigned. The durable WAL retains full history even though reads are retention-bounded. |
@@ -112,6 +113,33 @@ Resume exactly like a browser EventSource:
 `Last-Event-ID` may also be passed as `?lastEventId=`. Missing → replay the
 retained window from the beginning.
 
+**Severity filter** — a console that only watches certain severities adds the
+repeatable `severity` query parameter (1–4 non-empty, mutually distinct exact
+values; anything else is a **400** before the stream starts):
+
+```
+GET /streams/linac?severity=critical&severity=warning
+```
+
+Matching records arrive as normal `event` frames. Each run of consecutive
+non-matching records collapses into a single `checkpoint` frame whose `id`
+and `data.throughId` are both the last skipped record's global id:
+
+```
+id: 45
+event: checkpoint
+data: {"throughId":45}
+```
+
+The console renders nothing for it, but its resume cursor moves past the
+skipped records — so a channel quiet in the watched severities never strands
+the cursor behind the retention window. Checkpoints are emitted in publish
+order, stitched seamlessly between history and live, and every id is covered
+exactly once (as one event, or inside one checkpoint run). Omitting
+`severity` keeps the original unfiltered frame, resume, heartbeat and error
+semantics unchanged. Cursor expiry is always judged against the channel's
+**full** retention window, filter or not.
+
 **410 — cursor expired by retention** (sent before any SSE bytes):
 
 ```json
@@ -129,7 +157,10 @@ Reconnecting with the last displayed global id restores, in id order
 (= publish order), every still-available critical/warning event; nothing
 older than `earliestAvailableId` can be sent (410 tells the console where the
 live window starts); any conflicting batch returns a locatable 409 and
-changes nothing.
+changes nothing. With a `severity` filter active, the reconnect restores
+only the watched severities as alerts, while checkpoint frames replay the
+skipped coverage — so the console never loses its resume position to events
+it does not display.
 
 ## Run with Docker
 
@@ -148,8 +179,9 @@ curl -N localhost:8080/streams/linac
 ## One-shot `verify`
 
 Waits for `/health`, then aggregates **code tests, builds, publish/replay/
-conflict, live SSE + heartbeat, resume, expired-cursor and real-restart
-durability** into one bitmask exit code (`0` = all pass):
+conflict, unfiltered live SSE + heartbeat, unfiltered resume, filtered
+resume via checkpoints, quiet-channel cursor advancement, expired-cursor and
+real-restart durability** into one bitmask exit code (`0` = all pass):
 
 | bit | section |
 |---|---|
@@ -160,6 +192,7 @@ durability** into one bitmask exit code (`0` = all pass):
 | 16 | `go test ./...` |
 | 32 | build all binaries |
 | 64 | durability across an actual process restart |
+| 128 | severity filter: invalid → 400, checkpoint folding, filtered resume, quiet-channel advancement, filtered 410 |
 
 ```bash
 make verify                       # native one-shot gate
@@ -177,7 +210,7 @@ make test
 
 ```
 cmd/server/         HTTP/SSE service entrypoint
-cmd/smoke/          one-shot e2e verifier (publish/live/resume/410)
+cmd/smoke/          one-shot e2e verifier (publish/live/resume/410/filter)
 cmd/restart-smoke/  two-phase durability verifier (before/after restart)
 cmd/healthcheck/    tiny static /health probe for distroless HEALTHCHECK
 internal/store/     append-only log: global ids, atomic append, WAL, retention
